@@ -31,12 +31,6 @@ COUNTRY_EQUIVALENTS = {
     "taiwan":"republic of china","hong kong sar":"hong kong","macao sar":"macau","prc":"china"
 }
 
-# ✅ Only special manual cases
-DOMAIN_EQUIVALENCES = {
-    "thehutgroup":"the hut group",
-    "imperialbrandsplc":"imperial brands",
-}
-
 THRESHOLD = 70
 
 # ============================================================
@@ -44,6 +38,7 @@ THRESHOLD = 70
 # ============================================================
 
 def _normalize_tokens(text: str) -> str:
+    """Normalize company names by removing punctuation, suffixes, etc."""
     if not isinstance(text, str):
         return ""
     text = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
@@ -51,6 +46,7 @@ def _normalize_tokens(text: str) -> str:
     return " ".join(parts).strip()
 
 def _clean_domain(domain: str) -> str:
+    """Extract the core domain (e.g., example.com → example)."""
     if not isinstance(domain, str):
         return ""
     domain = domain.lower().strip()
@@ -61,6 +57,7 @@ def _clean_domain(domain: str) -> str:
     return parts[-2] if len(parts) >= 2 else domain
 
 def _extract_domain_from_email(email: str) -> str:
+    """Extract domain from email address."""
     if not isinstance(email, str) or "@" not in email:
         return ""
     domain = email.split("@")[-1].lower().strip()
@@ -69,10 +66,11 @@ def _extract_domain_from_email(email: str) -> str:
     return domain
 
 # ============================================================
-# 🌐 Company ↔ Domain Comparison (dynamic + scalable)
+# 🌐 Improved Company ↔ Domain Comparison
 # ============================================================
 
 def compare_company_domain(company: str, domain: str):
+    """Heuristically compare a company name to a web/email domain."""
     if not isinstance(company, str) or not isinstance(domain, str):
         return "Unsure – Please Check", 0, "missing input"
 
@@ -80,36 +78,23 @@ def compare_company_domain(company: str, domain: str):
     d_raw = domain.lower().strip()
     d = _clean_domain(d_raw)
 
-    if d in DOMAIN_EQUIVALENCES:
-        d = DOMAIN_EQUIVALENCES[d]
-
-    # ✅ Direct containment
+    # direct containment (handles abbreviations)
     if d in c.replace(" ", "") or c.replace(" ", "") in d:
         return "Likely Match", 100, "direct containment"
 
-    # ✅ Acronym or abbreviation detection
-    if len(d) <= 5 and d.isalpha():
-        company_tokens = [w[0] for w in c.split() if len(w) > 2]
-        acronym = "".join(company_tokens)
-        if fuzz.partial_ratio(acronym, d.upper()) >= 80:
-            return "Likely Match", 95, f"acronym match ({d.upper()} ↔ {acronym})"
-
-    # ✅ Token overlap
+    # token overlap
     if any(word in c for word in d.split()) or any(word in d for word in c.split()):
         score = fuzz.partial_ratio(c, d)
         if score >= 70:
             return "Likely Match", score, "token overlap"
 
-    # ✅ Brand term overlap
-    brand_terms = {"group","holdings","international","enterprise","labs","solutions",
-                   "systems","network","industries","pharma","medical","health",
-                   "energy","motors","brands"}
-    if any(t in c.split() for t in brand_terms) and any(t in d for t in brand_terms):
-        score = fuzz.partial_ratio(c, d)
-        if score >= 75:
-            return "Likely Match", score, "brand pattern overlap"
+    # brand suffix cues
+    BRAND_TERMS = {"bio","pharma","therapeutics","labs","health","med","rx","data","tech"}
+    if any(t in c for t in BRAND_TERMS) and any(t in d for t in BRAND_TERMS):
+        if fuzz.partial_ratio(c, d) >= 70:
+            return "Likely Match", 90, "brand term overlap"
 
-    # ✅ Fuzzy fallback
+    # fuzzy similarity fallback
     score_full = fuzz.token_sort_ratio(c, d)
     score_partial = fuzz.partial_ratio(c, d)
     score = max(score_full, score_partial)
@@ -131,17 +116,160 @@ def run_matching(master_file, picklist_file, highlight_changes=True, progress=gr
         df_master = pd.read_excel(master_file.name)
         df_picklist = pd.read_excel(picklist_file.name)
 
-        # (rest of your data logic stays unchanged)
-        # ...
-        # [keeping your matching, question mapping, and Excel coloring exactly the same as before]
+        progress(0.2, desc="🔧 Preparing data...")
+        EXACT_PAIRS = [
+            ("c_industry","c_industry"),
+            ("asset_title","asset_title"),
+            ("lead_country","lead_country"),
+            ("departments","departments"),
+            ("c_state","c_state")
+        ]
+        df_out = df_master.copy()
+        corrected_cells = set()
 
+        # ----------------------------------------------------
+        # Exact or normalized column matching
+        # ----------------------------------------------------
+        for master_col, picklist_col in EXACT_PAIRS:
+            out_col = f"Match_{master_col}"
+            if master_col in df_master.columns and picklist_col in df_picklist.columns:
+                pick_map = {v.strip().lower(): v.strip() for v in df_picklist[picklist_col].dropna().astype(str)}
+                matches, new_vals = [], []
+                for i, val in enumerate(df_master[master_col].fillna("").astype(str)):
+                    val_norm = val.strip().lower()
+                    if master_col.lower() in ["lead_country","country","c_country"]:
+                        val_norm = COUNTRY_EQUIVALENTS.get(val_norm, val_norm)
+                    if val_norm in pick_map:
+                        matches.append("Yes")
+                        new_val = pick_map[val_norm]
+                        new_vals.append(new_val)
+                        if new_val != val:
+                            corrected_cells.add((master_col, i + 2))
+                    else:
+                        matches.append("No")
+                        new_vals.append(val)
+                df_out[out_col] = matches
+                df_out[master_col] = new_vals
+            else:
+                df_out[out_col] = "Column Missing"
+
+        # ----------------------------------------------------
+        # Dynamic question columns (Q1, Q2, etc.)
+        # ----------------------------------------------------
+        q_cols = [c for c in df_picklist.columns if re.match(r"(?i)q0*\d+|question\s*\d+", c)]
+        for qc in q_cols:
+            out_col = f"Match_{qc}"
+            if qc in df_master.columns:
+                valid_answers = set(df_picklist[qc].dropna().astype(str).str.strip().str.lower())
+                matches = []
+                for val in df_master[qc].fillna("").astype(str):
+                    val_norm = val.strip().lower()
+                    if val_norm in valid_answers:
+                        matches.append("Yes")
+                    elif val_norm == "":
+                        matches.append("Blank")
+                    else:
+                        matches.append("No")
+                df_out[out_col] = matches
+            else:
+                df_out[out_col] = "Column Missing"
+
+        # ----------------------------------------------------
+        # Seniority parsing
+        # ----------------------------------------------------
+        def parse_seniority(title):
+            if not isinstance(title, str): return "Entry", "no title"
+            t = title.lower().strip()
+            if re.search(r"\bchief\b|\bcio\b|\bcto\b|\bceo\b|\bcfo\b|\bciso\b|\bcpo\b|\bcso\b|\bcoo\b|\bchro\b|\bpresident\b", t): return "C Suite", "c-level"
+            if re.search(r"\bvice president\b|\bvp\b|\bsvp\b|\bev\b", t): return "VP", "vp"
+            if re.search(r"\bhead\b", t): return "Head", "head"
+            if re.search(r"\bdirector\b", t): return "Director", "director"
+            if re.search(r"\bmanager\b|\bmgr\b", t): return "Manager", "manager"
+            if re.search(r"\bsenior\b|\bsr\b|\blead\b|\bprincipal\b", t): return "Senior", "senior"
+            if re.search(r"\bintern\b|\btrainee\b|\bassistant\b|\bgraduate\b", t): return "Entry", "entry"
+            return "Entry", "none"
+
+        if "jobtitle" in df_master.columns:
+            parsed = df_master["jobtitle"].apply(parse_seniority)
+            df_out["Parsed_Seniority"] = parsed.apply(lambda x: x[0])
+            df_out["Seniority_Logic"] = parsed.apply(lambda x: x[1])
+        else:
+            df_out["Parsed_Seniority"] = None
+            df_out["Seniority_Logic"] = "jobtitle column not found"
+
+        # ----------------------------------------------------
+        # Domain vs Company validation
+        # ----------------------------------------------------
+        progress(0.6, desc="🌐 Validating company ↔ domain...")
+        company_cols = [c for c in df_master.columns if c.strip().lower() in ["companyname","company","company name","company_name"]]
+        domain_cols = [c for c in df_master.columns if c.strip().lower() in ["website","domain","email domain","email_domain"]]
+        email_cols = [c for c in df_master.columns if "email" in c.lower()]
+
+        if company_cols:
+            company_col = company_cols[0]
+            domain_col = domain_cols[0] if domain_cols else None
+            email_col = email_cols[0] if email_cols else None
+            statuses, scores, reasons = [], [], []
+
+            for i in range(len(df_master)):
+                comp = df_master.at[i, company_col]
+                dom = None
+                if domain_col and pd.notna(df_master.at[i, domain_col]):
+                    dom = df_master.at[i, domain_col]
+                elif email_col and pd.notna(df_master.at[i, email_col]):
+                    dom = _extract_domain_from_email(df_master.at[i, email_col])
+                status, score, reason = compare_company_domain(comp, dom)
+                statuses.append(status)
+                scores.append(score)
+                reasons.append(reason)
+
+            df_out["Domain_Check_Status"] = statuses
+            df_out["Domain_Check_Score"] = scores
+            df_out["Domain_Check_Reason"] = reasons
+        else:
+            df_out["Domain_Check_Status"] = "No company/domain columns found"
+            df_out["Domain_Check_Score"] = None
+            df_out["Domain_Check_Reason"] = None
+
+        # ----------------------------------------------------
+        # Save + Highlighting
+        # ----------------------------------------------------
+        progress(0.9, desc="💾 Saving results...")
+        out_file = f"{os.path.splitext(master_file.name)[0]} - Full_Check_Results.xlsx"
+        df_out.to_excel(out_file, index=False)
+        wb = load_workbook(out_file)
+        ws = wb.active
+        yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        blue = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
+
+        for col_idx, col in enumerate(df_out.columns, start=1):
+            if col.startswith("Match_"):
+                for row in range(2, ws.max_row + 1):
+                    val = str(ws.cell(row=row, column=col_idx).value).strip().lower()
+                    if val == "yes":
+                        ws.cell(row=row, column=col_idx).fill = green
+                    elif val == "no":
+                        ws.cell(row=row, column=col_idx).fill = red
+                    else:
+                        ws.cell(row=row, column=col_idx).fill = yellow
+
+        if highlight_changes:
+            for col_name, row in corrected_cells:
+                if col_name in df_out.columns:
+                    col_idx = list(df_out.columns).index(col_name) + 1
+                    ws.cell(row=row, column=col_idx).fill = blue
+
+        wb.save(out_file)
+        progress(1.0, desc="✅ Done! File ready for download.")
         return out_file
 
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
 # ============================================================
-# 🎛️ Interface
+# 🎛️ Gradio Interface
 # ============================================================
 
 demo = gr.Interface(
@@ -153,11 +281,11 @@ demo = gr.Interface(
     ],
     outputs=gr.File(label="Download Processed File"),
     title="📊 Master–Picklist + Domain Matching Tool",
-    description="Upload MASTER & PICKLIST Excel files to auto-match, validate domains, map questions, and highlight differences.",
+    description="Upload MASTER & PICKLIST Excel files to auto-match, validate domains, map questions, and optionally highlight changed values."
 )
 
 # ============================================================
-# 🚀 Stable Launch (Railway-safe)
+# 🚀 Launch (Railway-safe)
 # ============================================================
 
 if __name__ == "__main__":
@@ -166,7 +294,7 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=port,
         share=False,
-        show_api=False,
+        show_api=False,        # avoids FastAPI schema crash
         prevent_thread_lock=True,
         quiet=True,
         max_threads=10
